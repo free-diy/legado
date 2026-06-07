@@ -20,41 +20,69 @@ jobs:
       - name: Sync Releases
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # UPSTREAM_REPO: "作者名/原仓库名"
           UPSTREAM_REPO: "Luoyacheng/legado"
         run: |
-          echo "正在获取上游仓库 $UPSTREAM_REPO 的最新 Release 信息..."
+          echo "正在获取上游仓库 $UPSTREAM_REPO 的 Release 列表..."
           
-          # 1. 获取上游最新 Release 的 Tag 名称
-          LATEST_TAG=$(gh api repos/$UPSTREAM_REPO/releases/latest --jq '.tag_name')
+          # 获取完整的 Releases JSON 列表
+          RELIASES_JSON=$(gh api repos/$UPSTREAM_REPO/releases)
           
-          if [ -z "$LATEST_TAG" ]; then
-            echo "错误：无法获取上游 Tag。"
+          if [ -z "$RELIASES_JSON" ] || [ "$RELIASES_JSON" = "null" ]; then
+            echo "错误：无法获取上游 Release 列表。"
             exit 1
           fi
+
+          # 1. 提取最新的正式版 (prerelease == false 的第一项)
+          LATEST_STABLE_JSON=$(echo "$RELIASES_JSON" | jq '[.[] | select(.prerelease == false)][0]')
           
-          echo "上游最新版本为: $LATEST_TAG"
+          # 2. 提取最新的预发布版 (prerelease == true 的第一项)
+          LATEST_PRE_JSON=$(echo "$RELIASES_JSON" | jq '[.[] | select(.prerelease == true)][0]')
 
-          # 2. 检查本地仓库是否已经存在该 Release
-          if gh release view "$LATEST_TAG" >/dev/null 2>&1; then
-            echo "版本 $LATEST_TAG 已存在，跳过同步。"
-          else
-            echo "发现新版本 $LATEST_TAG，开始同步..."
+          # 定义一个同步函数
+          sync_release() {
+            local rel_json="$1"
+            if [ -z "$rel_json" ] || [ "$rel_json" = "null" ]; then
+              return
+            fi
 
-            # 3. 下载上游 Release 的所有文件
-            mkdir -p ./sync_assets
-            gh release download "$LATEST_TAG" -R "$UPSTREAM_REPO" -D ./sync_assets
+            local tag_name=$(echo "$rel_json" | jq -r '.tag_name')
+            local rel_title=$(echo "$rel_json" | jq -r '.name')
+            local rel_body=$(echo "$rel_json" | jq -r '.body')
+            local is_prerelease=$(echo "$rel_json" | jq -r '.prerelease')
 
-            # 4. 获取上游 Release 的标题和内容 (Notes)
-            REL_TITLE=$(gh api repos/$UPSTREAM_REPO/releases/latest --jq '.name')
-            REL_BODY=$(gh api repos/$UPSTREAM_REPO/releases/latest --jq '.body')
+            echo "----------------------------------------------"
+            echo "检查版本: $tag_name (Pre-release: $is_prerelease)"
 
-            # 5. 在当前 Fork 仓库创建 Release 并上传文件
-            # 注意：这会自动在你的仓库同步对应的 Git Tag
-            gh release create "$LATEST_TAG" ./sync_assets/* \
-              --title "$REL_TITLE" \
-              --notes "$REL_BODY (Synced from $UPSTREAM_REPO)" \
-              --repo ${{ github.repository }}
+            # 检查本地是否已存在
+            if gh release view "$tag_name" >/dev/null 2>&1; then
+              echo "版本 $tag_name 本地已存在，跳过。"
+            else
+              echo "发现新版本 $tag_name，开始同步..."
+              
+              # 清理并创建临时下载目录
+              rm -rf ./sync_assets && mkdir -p ./sync_assets
+              gh release download "$tag_name" -R "$UPSTREAM_REPO" -D ./sync_assets
 
-            echo "同步完成！"
-          fi
+              # 判断预发布参数
+              local prerelease_arg=""
+              if [ "$is_prerelease" = "true" ]; then
+                prerelease_arg="--prerelease"
+              fi
+
+              # 创建 Release
+              gh release create "$tag_name" ./sync_assets/* \
+                $prerelease_arg \
+                --title "$rel_title" \
+                --notes "$rel_body (Synced from $UPSTREAM_REPO)" \
+                --repo ${{ github.repository }}
+
+              echo "版本 $tag_name 同步成功！"
+            fi
+          }
+
+          # 执行同步：分别传入最新正式版和最新预发布版
+          echo "开始检查最新正式版..."
+          sync_release "$LATEST_STABLE_JSON"
+
+          echo "开始检查最新预发布版..."
+          sync_release "$LATEST_PRE_JSON"
